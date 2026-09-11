@@ -10,3 +10,6 @@
 [submodule "lib/osero-address-registry"]
 	path = lib/osero-address-registry
 	url = https://github.com/osero-io/osero-address-registry
+[submodule "lib/pas"]
+	path = lib/pas
+	url = https://github.com/sky-ecosystem/pas
