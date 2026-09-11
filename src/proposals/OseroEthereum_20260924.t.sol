@@ -21,6 +21,24 @@ import {OseroEthereum_20260924} from "./OseroEthereum_20260924.sol";
 interface IPasConfiguratorLike {
     function beamState() external view returns (address);
     function setRateLimit(address rateLimits, bytes32 key, uint256 maxAmount, uint256 slope) external;
+    function callControllerAction(address controller, bytes calldata data) external returns (bytes memory ret);
+}
+
+interface IPasBeamStateLike {
+    function wards(address usr) external view returns (uint256);
+    function stopped() external view returns (bool);
+    function rateLimits(address rateLimits_) external view returns (uint256);
+    function controllers(address controller) external view returns (uint256);
+    function rateLimitsCBeams(address rateLimits_, address cBeam) external view returns (uint256);
+    function controllersCBeams(address controller, address cBeam) external view returns (uint256);
+    function getHop(address rateLimits_) external view returns (uint256);
+    function addRateLimits(address rateLimits_) external;
+    function addController(address controller) external;
+    function addCBeam(address cBeam) external;
+    function setCBeamForRateLimits(address rateLimits_, address cBeam) external;
+    function setCBeamForController(address controller, address cBeam) external;
+    function addInitRateLimits(bytes32 key, address rateLimits_, uint256 maxAmount, uint256 slope) external;
+    function addInitControllerActions(bytes calldata data, address controller) external returns (bytes32 key);
 }
 
 contract OseroEthereum_20260924_Test is CommonPauSpellTests {
@@ -64,12 +82,32 @@ contract OseroEthereum_20260924_Test is CommonPauSpellTests {
     // Short enough that the recovered amount stays below OPERATIONAL_TEST_AMOUNT (no max cap yet).
     uint256 internal constant PARTIAL_RECOVERY_TIME = 20 minutes;
 
+    // --- PAS integration fixture (NOT part of this payload) ---
+    // Osero registration and cBEAM pairing on the Sky-governed BeamState belong to a subsequent
+    // Sky Core spell. The fixture below models that future state so the two DEFAULT_ADMIN_ROLE
+    // grants in this payload can be exercised end-to-end through the Configurator.
+    // Synthetic cBEAM standing in for the Osero cBEAM that Sky Core will pair.
+    address internal constant FUTURE_OSERO_CBEAM = address(0xCBEA);
+    // Configurator decrease within the registered default (no hop required).
+    uint256 internal constant PAS_FIXTURE_LOWERED_MINT_MAX = 40_000_000e18;
+    uint256 internal constant PAS_FIXTURE_LOWERED_MINT_SLOPE = uint256(40_000_000e18) / 1 days;
+    // Configurator increase above the registered default: within BeamState maxChange (1.2x), after the hop.
+    uint256 internal constant PAS_FIXTURE_RAISED_MINT_MAX = 55_000_000e18;
+    // Controller admin action Sky Core would register for the Osero cBEAM; differs from the July value.
+    uint256 internal constant PAS_FIXTURE_SPARKLEND_USDS_MAX_SLIPPAGE = 0.999e18;
+
     bytes32 internal constant ROLE_GRANTED = keccak256("RoleGranted(bytes32,address,address)");
     bytes32 internal constant ROLE_REVOKED = keccak256("RoleRevoked(bytes32,address,address)");
     bytes32 internal constant RATE_LIMIT_DATA_SET =
         keccak256("RateLimitDataSet(bytes32,uint256,uint256,uint256,uint256)");
 
     IERC20 internal constant spUsds = IERC20(SPARKLEND_USDS_SPTOKEN);
+    IPasBeamStateLike internal constant beamState = IPasBeamStateLike(PAS_STATE);
+    IPasConfiguratorLike internal constant configurator = IPasConfiguratorLike(PAS_CONFIGURATOR);
+
+    // Configurator events (lib/pas/src/Configurator.sol), redeclared for `vm.expectEmit`.
+    event SetRateLimit(address indexed rateLimits, bytes32 indexed key, uint256 maxAmount, uint256 slope);
+    event CallControllerAction(address indexed controller, bytes data);
 
     constructor() {
         spellId = "20260924";
@@ -212,7 +250,150 @@ contract OseroEthereum_20260924_Test is CommonPauSpellTests {
 
         vm.prank(PERMISSIONLESS_EXECUTOR);
         vm.expectRevert(bytes("Configurator/not-authorized-ratelimits-cBeam"));
-        IPasConfiguratorLike(PAS_CONFIGURATOR).setRateLimit(OSERO_RATE_LIMITS, USDS_MINT_RATE_LIMIT_KEY, 1, 1);
+        configurator.setRateLimit(OSERO_RATE_LIMITS, USDS_MINT_RATE_LIMIT_KEY, 1, 1);
+    }
+
+    function test_ETHEREUM_pasConfiguratorSetsRateLimitAfterAuthorizationAndFuturePairing() public {
+        _executeSpellViaStarGuard(payload);
+        _pairFutureOseroCBeamAsSkyCore();
+
+        // Decrease within the registered default: no hop involved.
+        vm.expectEmit(PAS_CONFIGURATOR);
+        emit SetRateLimit(
+            OSERO_RATE_LIMITS, USDS_MINT_RATE_LIMIT_KEY, PAS_FIXTURE_LOWERED_MINT_MAX, PAS_FIXTURE_LOWERED_MINT_SLOPE
+        );
+        vm.prank(FUTURE_OSERO_CBEAM);
+        configurator.setRateLimit(
+            OSERO_RATE_LIMITS, USDS_MINT_RATE_LIMIT_KEY, PAS_FIXTURE_LOWERED_MINT_MAX, PAS_FIXTURE_LOWERED_MINT_SLOPE
+        );
+        _assertRateLimit(
+            USDS_MINT_RATE_LIMIT_KEY, PAS_FIXTURE_LOWERED_MINT_MAX, PAS_FIXTURE_LOWERED_MINT_SLOPE, "mint-lowered"
+        );
+
+        // Increase back to the registered default: consumes the hop and keeps the current capacity,
+        // unlike the payload's setRateLimitData which resets lastAmount to maxAmount.
+        vm.prank(FUTURE_OSERO_CBEAM);
+        configurator.setRateLimit(OSERO_RATE_LIMITS, USDS_MINT_RATE_LIMIT_KEY, USDS_MINT_MAX_LIMIT, USDS_MINT_SLOPE);
+        IRateLimitsLike.RateLimitData memory raised = rateLimits.getRateLimitData(USDS_MINT_RATE_LIMIT_KEY);
+        assertEq(raised.maxAmount, USDS_MINT_MAX_LIMIT, "mint-raised-max-amount");
+        assertEq(raised.slope, USDS_MINT_SLOPE, "mint-raised-slope");
+        assertEq(raised.lastAmount, PAS_FIXTURE_LOWERED_MINT_MAX, "mint-raised-last-amount-not-preserved");
+        assertEq(raised.lastUpdated, block.timestamp, "mint-raised-last-updated");
+        assertEq(
+            rateLimits.getCurrentRateLimit(USDS_MINT_RATE_LIMIT_KEY),
+            PAS_FIXTURE_LOWERED_MINT_MAX,
+            "mint-raised-current-limit"
+        );
+
+        // A further increase inside the hop window is rejected on the PAS side.
+        vm.prank(FUTURE_OSERO_CBEAM);
+        vm.expectRevert(bytes("Configurator/increment-too-soon"));
+        configurator.setRateLimit(
+            OSERO_RATE_LIMITS, USDS_MINT_RATE_LIMIT_KEY, PAS_FIXTURE_RAISED_MINT_MAX, USDS_MINT_SLOPE
+        );
+
+        // After the hop, an increase above the default is bounded by maxChange (1.2x the current max).
+        uint256 hop = beamState.getHop(OSERO_RATE_LIMITS);
+        vm.warp(block.timestamp + hop);
+        uint256 recovered = PAS_FIXTURE_LOWERED_MINT_MAX + USDS_MINT_SLOPE * hop;
+        uint256 expectedCapacity = recovered < USDS_MINT_MAX_LIMIT ? recovered : USDS_MINT_MAX_LIMIT;
+        assertEq(rateLimits.getCurrentRateLimit(USDS_MINT_RATE_LIMIT_KEY), expectedCapacity, "mint-capacity-after-hop");
+
+        vm.prank(FUTURE_OSERO_CBEAM);
+        configurator.setRateLimit(
+            OSERO_RATE_LIMITS, USDS_MINT_RATE_LIMIT_KEY, PAS_FIXTURE_RAISED_MINT_MAX, USDS_MINT_SLOPE
+        );
+        raised = rateLimits.getRateLimitData(USDS_MINT_RATE_LIMIT_KEY);
+        assertEq(raised.maxAmount, PAS_FIXTURE_RAISED_MINT_MAX, "mint-raised-above-default-max-amount");
+        assertEq(raised.slope, USDS_MINT_SLOPE, "mint-raised-above-default-slope");
+        assertEq(raised.lastAmount, expectedCapacity, "mint-raised-above-default-last-amount");
+        assertEq(raised.lastUpdated, block.timestamp, "mint-raised-above-default-last-updated");
+
+        _assertRetainedRoles();
+    }
+
+    function test_ETHEREUM_pasConfiguratorCannotLowerUnlimitedLimitsAfterFuturePairing() public {
+        _executeSpellViaStarGuard(payload);
+        _pairFutureOseroCBeamAsSkyCore();
+
+        // Burn and withdraw stay unlimited with no BeamState default, so the Configurator may only
+        // keep them at (max, 0) even though it now holds DEFAULT_ADMIN_ROLE on the RateLimits.
+        vm.prank(FUTURE_OSERO_CBEAM);
+        vm.expectRevert(bytes("Configurator/unlimited-incorrect-params"));
+        configurator.setRateLimit(OSERO_RATE_LIMITS, USDS_BURN_RATE_LIMIT_KEY, USDS_MINT_MAX_LIMIT, USDS_MINT_SLOPE);
+
+        vm.prank(FUTURE_OSERO_CBEAM);
+        vm.expectRevert(bytes("Configurator/unlimited-incorrect-params"));
+        configurator.setRateLimit(
+            OSERO_RATE_LIMITS, SPARKLEND_USDS_WITHDRAW_RATE_LIMIT_KEY, USDS_MINT_MAX_LIMIT, USDS_MINT_SLOPE
+        );
+
+        _assertExistingUnlimitedRateLimit(USDS_BURN_RATE_LIMIT_KEY, "burn");
+        _assertExistingUnlimitedRateLimit(SPARKLEND_USDS_WITHDRAW_RATE_LIMIT_KEY, "spark-withdraw");
+    }
+
+    function test_ETHEREUM_pasConfiguratorCallsControllerActionAfterAuthorizationAndFuturePairing() public {
+        _executeSpellViaStarGuard(payload);
+        _pairFutureOseroCBeamAsSkyCore();
+
+        assertEq(controller.aave_getMaxSlippage(SPARKLEND_USDS_SPTOKEN), SPARKLEND_USDS_MAX_SLIPPAGE, "slippage-before");
+
+        bytes memory data = _pasFixtureControllerAction();
+        vm.expectEmit(PAS_CONFIGURATOR);
+        emit CallControllerAction(OSERO_CONTROLLER, data);
+        vm.prank(FUTURE_OSERO_CBEAM);
+        configurator.callControllerAction(OSERO_CONTROLLER, data);
+
+        assertEq(
+            controller.aave_getMaxSlippage(SPARKLEND_USDS_SPTOKEN),
+            PAS_FIXTURE_SPARKLEND_USDS_MAX_SLIPPAGE,
+            "slippage-not-set-by-configurator"
+        );
+        _assertRetainedRoles();
+    }
+
+    function test_ETHEREUM_pasConfiguratorRejectsUnregisteredControllerActionAfterFuturePairing() public {
+        _executeSpellViaStarGuard(payload);
+        _pairFutureOseroCBeamAsSkyCore();
+
+        // Only actions Sky Core registered in BeamState can be dispatched to the Osero controller.
+        vm.prank(FUTURE_OSERO_CBEAM);
+        vm.expectRevert(bytes("Configurator/not-valid-data"));
+        configurator.callControllerAction(
+            OSERO_CONTROLLER, abi.encodeCall(IOseroPauControllerLike.usds_setVault, (address(0)))
+        );
+
+        assertEq(controller.usds_vault(), OSERO_ALLOCATOR_VAULT, "vault-changed");
+    }
+
+    function test_ETHEREUM_pasOperationsRevertWithoutSpellGrantsEvenWhenPaired() public {
+        // Pairing alone is not enough: without this payload's two grants, the Configurator passes
+        // every PAS-side check and then fails on the Osero AccessControls / RateLimits role gate.
+        _pairFutureOseroCBeamAsSkyCore();
+        IRateLimitsLike.RateLimitData memory mintBefore = rateLimits.getRateLimitData(USDS_MINT_RATE_LIMIT_KEY);
+
+        vm.prank(FUTURE_OSERO_CBEAM);
+        vm.expectRevert(
+            abi.encodeWithSignature(
+                "AccessControlUnauthorizedAccount(address,bytes32)", PAS_CONFIGURATOR, DEFAULT_ADMIN_ROLE
+            )
+        );
+        configurator.setRateLimit(
+            OSERO_RATE_LIMITS, USDS_MINT_RATE_LIMIT_KEY, PAS_FIXTURE_LOWERED_MINT_MAX, PAS_FIXTURE_LOWERED_MINT_SLOPE
+        );
+
+        vm.prank(FUTURE_OSERO_CBEAM);
+        vm.expectRevert(bytes("Configurator/call-failed"));
+        configurator.callControllerAction(OSERO_CONTROLLER, _pasFixtureControllerAction());
+
+        assertEq(
+            controller.aave_getMaxSlippage(SPARKLEND_USDS_SPTOKEN), SPARKLEND_USDS_MAX_SLIPPAGE, "slippage-changed"
+        );
+        IRateLimitsLike.RateLimitData memory mintAfter = rateLimits.getRateLimitData(USDS_MINT_RATE_LIMIT_KEY);
+        assertEq(mintAfter.maxAmount, mintBefore.maxAmount, "mint-max-changed-without-spell");
+        assertEq(mintAfter.slope, mintBefore.slope, "mint-slope-changed-without-spell");
+        assertEq(mintAfter.lastAmount, mintBefore.lastAmount, "mint-last-amount-changed-without-spell");
+        assertEq(mintAfter.lastUpdated, mintBefore.lastUpdated, "mint-last-updated-changed-without-spell");
     }
 
     function test_ETHEREUM_usdsMintBurnOperationalThroughAdministeredAgent() public {
@@ -426,6 +607,47 @@ contract OseroEthereum_20260924_Test is CommonPauSpellTests {
         // rate limit. This is test funding, not a coordinated Sky Core action or a debt-ceiling change.
         deal(USDS, OSERO_ALM_PROXY, usds.balanceOf(OSERO_ALM_PROXY) + OPERATIONAL_TEST_AMOUNT);
         _callAsOseroActor(abi.encodeCall(IOseroPauControllerLike.usds_burn, (OPERATIONAL_TEST_AMOUNT)));
+    }
+
+    /// @dev PAS integration fixture, NOT part of this payload. Models the subsequent Sky Core spell
+    ///      that registers the Osero RateLimits/Controller with PAS, whitelists and pairs an Osero
+    ///      cBEAM, and registers the approved defaults/actions. On-chain these go through the PAS
+    ///      Timelock (registration) and Core Council (pairing); the test takes the PauseProxy ward
+    ///      shortcut on BeamState since the outcome is identical.
+    function _pairFutureOseroCBeamAsSkyCore() internal {
+        // Pre-state at the fork block: PAS is live, Osero is not registered or paired.
+        assertEq(beamState.wards(MCD_PAUSE_PROXY), 1, "pause-proxy-not-beamstate-ward");
+        assertFalse(beamState.stopped(), "beamstate-stopped");
+        assertEq(beamState.rateLimits(OSERO_RATE_LIMITS), 0, "osero-ratelimits-already-registered");
+        assertEq(beamState.controllers(OSERO_CONTROLLER), 0, "osero-controller-already-registered");
+        assertEq(
+            beamState.rateLimitsCBeams(OSERO_RATE_LIMITS, FUTURE_OSERO_CBEAM), 0, "cbeam-already-paired-ratelimits"
+        );
+        assertEq(
+            beamState.controllersCBeams(OSERO_CONTROLLER, FUTURE_OSERO_CBEAM), 0, "cbeam-already-paired-controller"
+        );
+        assertGt(beamState.getHop(OSERO_RATE_LIMITS), 0, "beamstate-hop-not-set");
+
+        vm.startPrank(MCD_PAUSE_PROXY);
+        beamState.addRateLimits(OSERO_RATE_LIMITS);
+        beamState.addController(OSERO_CONTROLLER);
+        beamState.addCBeam(FUTURE_OSERO_CBEAM);
+        beamState.setCBeamForRateLimits(OSERO_RATE_LIMITS, FUTURE_OSERO_CBEAM);
+        beamState.setCBeamForController(OSERO_CONTROLLER, FUTURE_OSERO_CBEAM);
+        beamState.addInitRateLimits(USDS_MINT_RATE_LIMIT_KEY, OSERO_RATE_LIMITS, USDS_MINT_MAX_LIMIT, USDS_MINT_SLOPE);
+        beamState.addInitControllerActions(_pasFixtureControllerAction(), OSERO_CONTROLLER);
+        vm.stopPrank();
+
+        assertEq(beamState.rateLimitsCBeams(OSERO_RATE_LIMITS, FUTURE_OSERO_CBEAM), 1, "cbeam-not-paired-ratelimits");
+        assertEq(beamState.controllersCBeams(OSERO_CONTROLLER, FUTURE_OSERO_CBEAM), 1, "cbeam-not-paired-controller");
+    }
+
+    /// @dev The controller admin action the fixture registers for the Osero cBEAM.
+    function _pasFixtureControllerAction() internal pure returns (bytes memory) {
+        return abi.encodeCall(
+            IOseroPauControllerLike.aave_setMaxSlippage,
+            (SPARKLEND_USDS_SPTOKEN, PAS_FIXTURE_SPARKLEND_USDS_MAX_SLIPPAGE)
+        );
     }
 
     function _assertRetainedRoles() internal view {
